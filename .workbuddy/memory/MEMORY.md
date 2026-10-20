@@ -4,6 +4,15 @@
 
 路径：`D:/projects/maze` · 起始：2026-10-21
 
+### Git 远程（2026-10-21 建立）
+- 仓库：**https://github.com/simtfer/dual-face-maze**（**PUBLIC**，用户明确选择公开）
+- 远程：`git@github.com:simtfer/dual-face-maze.git`（SSH）
+- 本地分支 `main` 跟踪 `origin/main`；首次提交 `1c95474`
+- ⚠️ 本项目**没有** `core.sshCommand` 的 WSL 路径坑 —— 那只存在于 obsidian-vault 仓库。
+  本机全局 git 身份已是 `simtfer <20667469+simtfer@users.noreply.github.com>`，
+  与 GitHub 账号一致，提交归属正常。
+- `.gitignore` 已排除 `.playwright-cli/`（浏览器会话产物）；`.workbuddy/memory/` **保留在版本控制内**。
+
 ### 定位
 HTML 版双面迷宫游戏，**后续计划发布到抖音小游戏和微信小游戏**。
 ⇒ 架构上必须保证「核心逻辑与渲染不依赖 DOM」，小游戏移植只重写引导层。
