@@ -191,9 +191,10 @@
    * 直到铺满。相邻性保证区域始终连通。
    *
    * @param {number[][]} seeds 每个区域的种子格（组内必须连通）
+   * @param {Set<number>} exclude 禁区（实心块），不参与分配
    * @returns {{label: Int16Array, cells: number[][], sizes: number[], complete: boolean}}
    */
-  function growRegions(cols, rows, seeds, rng) {
+  function growRegions(cols, rows, seeds, rng, exclude) {
     var total = cols * rows;
     var label = new Int16Array(total);
     for (var i = 0; i < total; i++) label[i] = -1;
@@ -203,6 +204,11 @@
     for (var r = 0; r < count; r++) { cells.push([]); fronts.push([]); sizes.push(0); }
 
     var remaining = total;
+    if (exclude) {
+      exclude.forEach(function (c) {
+        if (c >= 0 && c < total && label[c] === -1) { label[c] = -2; remaining--; }
+      });
+    }
     for (var r = 0; r < count; r++) {
       for (var t = 0; t < seeds[r].length; t++) {
         var c = seeds[r][t];
@@ -261,24 +267,106 @@
   }
 
   /**
-   * 按区域标签雕刻迷宫：
-   * 每个区域内部生成一棵随机生成树（DFS），区域之间完全封死。
-   * 于是「密室」内部仍是迷宫状走廊，而密室之间互不相通。
+   * 在开放网格上求两点间的最短路（忽略墙），可指定禁行格。
+   * 用于给密室铺设「主脊」——连接该密室的进出两个洞口。
+   *
+   * @param {Set<number>|null} blocked 不可经过的格
+   * @returns {number[]|null} 从 from 到 to 的格序列（含两端）
    */
-  Maze.prototype.carveByLabel = function (label, regionCount, rng) {
+  function gridPath(cols, rows, from, to, blocked) {
+    var total = cols * rows;
+    if (from === to) return [from];
+    var prev = new Int32Array(total).fill(-1);
+    var seen = new Uint8Array(total);
+    var queue = [from];
+    seen[from] = 1;
+    var head = 0;
+    while (head < queue.length) {
+      var c = queue[head++];
+      var x = c % cols, y = (c / cols) | 0;
+      for (var k = 0; k < 4; k++) {
+        var d = DIRS[k];
+        var nx = x + d.dx, ny = y + d.dy;
+        if (nx < 0 || ny < 0 || nx >= cols || ny >= rows) continue;
+        var ni = ny * cols + nx;
+        if (seen[ni]) continue;
+        if (blocked && blocked.has(ni)) continue;
+        seen[ni] = 1;
+        prev[ni] = c;
+        if (ni === to) {
+          var path = [];
+          for (var p = ni; p !== -1; p = prev[p]) path.push(p);
+          path.reverse();
+          return path;
+        }
+        queue.push(ni);
+      }
+    }
+    return null;
+  }
+
+  /**
+   * 按区域标签雕刻迷宫。
+   *
+   * 雕刻分三步：
+   *   1. 先把该区域的「主脊」整条打通 —— 主脊是一串首尾相接的格子，
+   *      它连接着密室的进/出两个洞口；
+   *   2. 区域里剩下的格子再从主脊长成树枝。每格只跟一个父格相连，
+   *      所以区域是一棵树 ⇒ 主脊长度就是「入口→出口」的最短距离，
+   *      玩家<b>不可能</b>把密室一步跨过去；
+   *   3. 最后在同一支系里打通一两堵墙形成环路，让玩家在
+   *      「绕远捡符印」与「直接穿过去」之间有得选。
+   *
+   * @param {Int16Array} label 每格所属区域（-1 = 实心，不属于任何区域）
+   * @param {number} regionCount 区域总数
+   * @param {function} rng
+   * @param {object} plan
+   *   plan.corridor {number: number[]}  各区域的主脊
+   *   plan.mouths   {number: number[]}  各区域进/出洞口（用于校验环路不会缩短主脊）
+   *   plan.loops    每个区域额外打开的环路数量
+   */
+  Maze.prototype.carveByLabel = function (label, regionCount, rng, plan) {
+    plan = plan || {};
     var total = this.cols * this.rows;
     for (var i = 0; i < total; i++) this.walls[i] = N | E | S | W;
 
+    var corridors = plan.corridor || {};
+    var mouths = plan.mouths || {};
+    var wantLoops = plan.loops != null ? plan.loops : 2;
+
     var byRegion = [];
     for (var r = 0; r < regionCount; r++) byRegion.push([]);
-    for (i = 0; i < total; i++) byRegion[label[i]].push(i);
+    for (i = 0; i < total; i++) {
+      if (label[i] >= 0 && label[i] < regionCount) byRegion[label[i]].push(i);
+    }
+
+    // depth：距主脊的树枝深度（主脊为 0）；attach：挂在主脊的哪一节
+    this.depth = new Int32Array(total).fill(-1);
+    this.attach = new Int32Array(total).fill(-1);
+    this.parent = new Int32Array(total).fill(-1);
 
     for (var r = 0; r < regionCount; r++) {
       var list = byRegion[r];
       if (!list.length) continue;
+      var corridor = corridors[r] || [];
       var seen = new Uint8Array(total);
-      var stack = [list[0]];
-      seen[list[0]] = 1;
+
+      // 1) 打通主脊
+      for (var ci = 0; ci < corridor.length; ci++) {
+        var cell = corridor[ci];
+        seen[cell] = 1;
+        this.depth[cell] = 0;
+        this.attach[cell] = ci;
+        if (ci > 0) {
+          this.openBetween(corridor[ci - 1], cell);
+          this.parent[cell] = corridor[ci - 1];
+        }
+      }
+
+      // 2) 从主脊长出树枝（每格只挂一个父格 ⇒ 区域是一棵树）
+      //    注意：这里必须「窥栈顶」而不是「弹栈」——弹栈会把当前格剩下的
+      //    候选邻居直接丢掉，导致大片格子成为走不到的孤立碎块。
+      var stack = corridor.slice();
       while (stack.length) {
         var cur = stack[stack.length - 1];
         var cx = this.xOf(cur), cy = this.yOf(cur);
@@ -296,19 +384,95 @@
         this.walls[cur] &= ~pick[1].bit;
         this.walls[pick[0]] &= ~pick[1].opp;
         seen[pick[0]] = 1;
+        this.parent[pick[0]] = cur;
+        this.depth[pick[0]] = this.depth[cur] + 1;
+        this.attach[pick[0]] = this.attach[cur];
         stack.push(pick[0]);
       }
+
+      // 3) 造环：优先打通「主脊 ↔ 树枝」之间的墙，在主脊旁边掏出小口袋，
+      //    让玩家在主路与绕行之间有得选。每开一堵墙都复核一遍
+      //    「入口→出口」距离有没有被缩短——变短了就撤销。
+      var pair = mouths[r];
+      if (!pair || wantLoops <= 0) continue;
+      var A = pair[0], B = pair[1];
+      var baseLen = this.pathLen(A, B);
+      if (baseLen < 0) continue;
+
+      var cand = [];
+      for (var t = 0; t < list.length; t++) {
+        var u = list[t];
+        var ux = this.xOf(u), uy = this.yOf(u);
+        for (var k2 = 0; k2 < 4; k2++) {
+          var d2 = DIRS[k2];
+          var vx = ux + d2.dx, vy = uy + d2.dy;
+          if (!this.inBounds(vx, vy)) continue;
+          var v = this.idx(vx, vy);
+          if (label[v] !== r) continue;
+          if (!(this.walls[u] & d2.bit)) continue;      // 这堵墙已经通了
+          // 一端贴着主脊的优先：这种环一定不会缩短主脊
+          var prio = (this.depth[u] === 0 || this.depth[v] === 0) ? 0 : 1;
+          cand.push({ u: u, v: v, bit: d2.bit, opp: d2.opp, prio: prio });
+        }
+      }
+      cand.sort(function (a, b) { return a.prio - b.prio; });
+
+      var made = 0;
+      for (var ci = 0; ci < cand.length && made < wantLoops; ci++) {
+        var e = cand[ci];
+        this.walls[e.u] &= ~e.bit;
+        this.walls[e.v] &= ~e.opp;
+        if (this.pathLen(A, B) < baseLen) {   // 变成捷径了，撤销
+          this.walls[e.u] |= e.bit;
+          this.walls[e.v] |= e.opp;
+          continue;
+        }
+        made++;
+      }
     }
+    return this;
+  };
+
+  /** 两点之间的最短步数；不可达返回 -1 */
+  Maze.prototype.pathLen = function (a, b) {
+    var p = this.findPath(a, b);
+    return p === null ? -1 : p.length;
+  };
+
+  /**
+   * 统计各区域的环路数：开放边数 - 顶点数 + 1。
+   * 0 = 纯树（玩家没有第二个选择），>0 = 存在可选的绕行路线。
+   */
+  Maze.prototype.cycleStats = function (label, regionCount) {
+    var res = [];
+    for (var r = 0; r < regionCount; r++) res.push({ cells: 0, edges: 0, cycles: 0 });
+    var total = this.cols * this.rows;
+    for (var i = 0; i < total; i++) {
+      var lr = label[i];
+      if (lr < 0 || lr >= regionCount) continue;
+      res[lr].cells++;
+      var x = this.xOf(i), y = this.yOf(i);
+      if (x < this.cols - 1) {
+        var e = this.idx(x + 1, y);
+        if (label[e] === lr && !(this.walls[i] & E)) res[lr].edges++;
+      }
+      if (y < this.rows - 1) {
+        var s = this.idx(x, y + 1);
+        if (label[s] === lr && !(this.walls[i] & S)) res[lr].edges++;
+      }
+    }
+    for (var q = 0; q < regionCount; q++) res[q].cycles = res[q].edges - res[q].cells + 1;
+    return res;
   };
 
   /** 按区域标签直接构造一个迷宫（不先生成整树再切割） */
-  Maze.fromLabels = function (cols, rows, label, regionCount, rng) {
+  Maze.fromLabels = function (cols, rows, label, regionCount, rng, plan) {
     var m = Object.create(Maze.prototype);
     m.cols = cols;
     m.rows = rows;
     m.walls = new Uint8Array(cols * rows);
     m.rng = rng || Math.random;
-    m.carveByLabel(label, regionCount, m.rng);
+    m.carveByLabel(label, regionCount, m.rng, plan);
     return m;
   };
 
@@ -357,6 +521,7 @@
     oppOf: oppOf,
     mulberry32: mulberry32,
     shuffle: shuffle,
-    growRegions: growRegions
+    growRegions: growRegions,
+    gridPath: gridPath
   };
 });
